@@ -7,8 +7,13 @@
  
 package frc.robot.commands;
 
+import com.nrg948.preferences.RobotPreferences;
+import com.nrg948.preferences.RobotPreferencesValue;
 import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.ProfiledPIDController;
+import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.wpilibj.GenericHID.RumbleType;
+import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import frc.robot.subsystems.Subsystems;
@@ -24,6 +29,27 @@ public class DriveUsingController extends Command {
   private final Swerve drivetrain;
   private final CommandXboxController xboxController;
 
+  private static final double LOCK_ORIENTATION_DELAY = 0.5; // Seconds
+  private static final double AUTO_ORIENTATION_SPEED_THRESHOLD = 0.05; // Meters per second
+
+  @RobotPreferencesValue(column = 0, row = 1)
+  public static final RobotPreferences.DoubleValue AUTO_ORIENT_KP =
+      new RobotPreferences.DoubleValue("Drive", "Auto Orient kP", 1.0);
+
+  @RobotPreferencesValue(column = 1, row = 1)
+  public static final RobotPreferences.DoubleValue AUTO_ORIENT_KI =
+      new RobotPreferences.DoubleValue("Drive", "Auto Orient kI", 0);
+
+  @RobotPreferencesValue(column = 2, row = 1)
+  public static final RobotPreferences.DoubleValue AUTO_ORIENT_KD =
+      new RobotPreferences.DoubleValue("Drive", "Auto Orient kD", 0);
+
+  private ProfiledPIDController controller;
+  private double previousRInput = 0;
+  private boolean isRotationLocked = false;
+  private Rotation2d lockedRotation = new Rotation2d();
+  private final Timer lockOrientationTimer = new Timer();
+
   /** Creates a new DriveUsingController. */
   public DriveUsingController(Subsystems subsystems, CommandXboxController xboxController) {
     // Use addRequirements() here to declare subsystem dependencies.
@@ -34,26 +60,69 @@ public class DriveUsingController extends Command {
 
   // Called when the command is initially scheduled.
   @Override
-  public void initialize() {}
+  public void initialize() {
+    controller =
+        new ProfiledPIDController(
+            AUTO_ORIENT_KP.getValue(),
+            AUTO_ORIENT_KI.getValue(),
+            AUTO_ORIENT_KD.getValue(),
+            Swerve.getRotationalConstraints());
+    controller.enableContinuousInput(-Math.PI, Math.PI);
+    controller.setIZone(Math.toRadians(5));
+    controller.reset(drivetrain.getOrientation().getRadians());
+  }
 
   // Called every time the scheduler runs while the command is scheduled.
   @Override
   public void execute() {
-    double rSpeed = -xboxController.getRightX();
-    double xSpeed = -xboxController.getLeftY();
-    double ySpeed = -xboxController.getLeftX();
+    double rInput = -xboxController.getRightX();
+    double xInput = -xboxController.getLeftY();
+    double yInput = -xboxController.getLeftX();
     double inputScalar = Math.max(1.0 - xboxController.getRightTriggerAxis(), 0.15);
 
     // Applies deadbands to x and y joystick values and multiples all
     // values with inputScalar which allows finer driving control.
-    xSpeed = MathUtil.applyDeadband(xSpeed, DEADBAND) * inputScalar;
-    ySpeed = MathUtil.applyDeadband(ySpeed, DEADBAND) * inputScalar;
-    rSpeed = MathUtil.applyDeadband(rSpeed, DEADBAND) * inputScalar;
+    rInput = MathUtil.applyDeadband(rInput, DEADBAND) * inputScalar;
+    xInput = MathUtil.applyDeadband(xInput, DEADBAND) * inputScalar;
+    yInput = MathUtil.applyDeadband(yInput, DEADBAND) * inputScalar;
 
-    drivetrain.drive(xSpeed, ySpeed, rSpeed, true);
+    if (rInput == 0) {
+      if (previousRInput != 0) {
+        lockOrientationTimer.reset();
+        lockOrientationTimer.start();
+      } else if (lockOrientationTimer.get() > LOCK_ORIENTATION_DELAY) {
+        isRotationLocked = true;
+        lockOrientationTimer.stop();
+        lockOrientationTimer.reset();
+        lockedRotation = drivetrain.getOrientation();
+      }
+    } else {
+      if (isRotationLocked) {
+        isRotationLocked = false;
+      }
+    }
+
+    previousRInput = rInput;
+    double rSpeed;
+
+    // If the orientation is locked, maintain the orientation using PID.
+    if (isRotationLocked) {
+      double feedback =
+          controller.calculate(
+              drivetrain.getOrientation().getRadians(), lockedRotation.getRadians());
+
+      rSpeed =
+          feedback
+              + (controller.getSetpoint().velocity / Swerve.getRotationalConstraints().maxVelocity);
+    } else {
+      rSpeed = rInput;
+    }
+
+    drivetrain.drive(xInput, yInput, rSpeed, true);
 
     if (Swerve.ENABLE_RUMBLE.getValue()) {
-      // Rumbles the driver controller based on a exponential scale based on acceleration between
+      // Rumbles the driver controller based on a exponential scale based on
+      // acceleration between
       // min and max.
       double rumblePower =
           MathUtil.inverseInterpolate(RUMBLE_MIN_G, RUMBLE_MAX_G, drivetrain.getAcceleration());
